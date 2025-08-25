@@ -1,60 +1,124 @@
-import boto3 # AWS SDK for Python
-import botocore.config  # AWS SDK for Python
 import json
-from datetime import datetime
+import os
+import base64
+from datetime import datetime, timezone
 
-'''
+import boto3
+import botocore.config
+
+"""
 The application is for creating a blog
-'''
+"""
+
+BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-east-1")
+BEDROCK_MODEL_ID = os.environ.get(
+    "BEDROCK_MODEL_ID",
+    "us.meta.llama3-2-1b-instruct-v1:0"  # <-- profile ID (works in modelId)
+    # or: "arn:aws:bedrock:us-east-1::inference-profile/us.meta.llama3-2-1b-instruct-v1:0"
+)
+S3_BUCKET = os.environ.get("S3_BUCKET", "awsbedrockcourse1rick")
+
+bedrock = boto3.client(
+    "bedrock-runtime",
+    region_name=BEDROCK_REGION,
+    config=botocore.config.Config(read_timeout=300, retries={"max_attempts": 3})
+)
+s3 = boto3.client("s3")
+
 
 def blog_generate_using_bedrock(blog_topic: str) -> str:
-    prompt = f"""<s>[INST]Human: Write a 200 words blog on the topic {blog_topic}
-    Assistant:[/INST]
-    """
-
-    body = { # Request body for Bedrock API
-    "prompt": prompt,
-    "max_gen_len": 512,
-    "temperature": 0.5,
-    "top_p": 0.9,
+    prompt = f"""[INST]Human: Write a ~200 word blog on the topic: {blog_topic}
+Assistant:[/INST]
+"""
+    body = {
+        "prompt": prompt,
+        "max_gen_len": 512,
+        "temperature": 0.5,
+        "top_p": 0.9,
     }
 
     try:
-        bedrock = boto3.client("bedrock-runtime", region_name="us-east-1",
-                               config=botocore.config.Config(read_timeout=300, retries = {"max_attempts" : 3})) 
-        response = bedrock.invoke_model(body = json.dumps(body), modelId = "meta.llama3-2-1b-instruct-v1:0") # Invoking the model
-        response_content = response.get('body').read() # Read the response content
-        response_data = json.loads(response_content) # Parse the response content as JSON
-        print(response_data) # Print the response data
-        blog_details = response_data['generation']
-        return blog_details
-    except Exception as e: # Logs will be shown in  AWS CloudWatch
-        print(f"Error generating the Blog : {e}")
-        return "" # Returning Blank Screen
+        resp = bedrock.invoke_model(
+            modelId=BEDROCK_MODEL_ID,
+            body=json.dumps(body),
+            contentType="application/json",
+            accept="application/json",
+        )
+        raw = resp["body"].read()
+        data = json.loads(raw)
 
-def save_blog_details_in_s3(s3_key: str, s3_bucket: str, generate_blog: str): # Function to save blog content in S3
-    s3 = boto3.client("s3")
+        # Bedrock response shapes can differ slightly between models.
+        # Prefer "generation", but fall back to common alternatives.
+        if "generation" in data:
+            return data["generation"]
+        if "output" in data and isinstance(data["output"], dict) and "text" in data["output"]:
+            return data["output"]["text"]
+        if "outputs" in data and isinstance(data["outputs"], list) and data["outputs"]:
+            out0 = data["outputs"][0]
+            if isinstance(out0, dict) and "text" in out0:
+                return out0["text"]
+
+        print(f"Unexpected Bedrock response format: {data}")
+        return ""
+    except Exception as e:
+        print(f"Error generating the Blog : {e}")
+        return ""
+
+
+def save_blog_details_in_s3(s3_key: str, s3_bucket: str, generate_blog: str):
     try:
-        s3.put_object(Body=generate_blog, Bucket=s3_bucket, Key=s3_key)
+        s3.put_object(Body=generate_blog.encode("utf-8"), Bucket=s3_bucket, Key=s3_key)
     except Exception as e:
         print(f"Error saving blog details to S3 : {e}")
-# 
-def lambda_handler(event, context): # Lambda function handler : Triggering to generate blog
-    # TODO implement
-    event = json.load(event['body']) # Loading the event body
-    blogTopic = event['blog_topic']
+        raise
 
-    generate_blog = blog_generate_using_bedrock(blog_topic=blogTopic) # Generating the blog using Bedrock
 
-    if generate_blog: # If blog is generated - we need to store it in the S3 Bucket
-        current_time = datetime.now().strftime("%H%M%S") # Getting the current time
-        s3_key = f"blog-output/{current_time}.txt" # S3 key for the blog output
-        s3_bucket = "aws_bedrock_course1"
-        save_blog_details_in_s3(s3_key, s3_bucket, generate_blog) # Saving blog details in S3
-    else:
-        print("No Blog was Generated !")
+def _parse_event_body(event: dict) -> dict:
+    """
+    Handles:
+      - API Gateway (v1/v2) where event['body'] is a JSON string
+      - Optional base64 encoding (event['isBase64Encoded'] == True)
+      - Direct lambda test events with already-parsed 'body' dict
+    """
+    body = event.get("body", {})
+    if isinstance(body, dict):
+        return body
 
-    return {
-        'statusCode' : 200, # Success
-        'body' : json.dumps('Blog Generated Successfully !')
-    }
+    if isinstance(body, str):
+        if event.get("isBase64Encoded"):
+            try:
+                body = base64.b64decode(body).decode("utf-8")
+            except Exception as e:
+                raise ValueError(f"Failed to base64-decode body: {e}")
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Body is not valid JSON: {e}")
+
+    # Fallback for unexpected shapes
+    raise ValueError("Event body not found or in unsupported format.")
+
+
+def lambda_handler(event, context):
+    try:
+        body = _parse_event_body(event)
+        blog_topic = body.get("blog_topic")
+        if not blog_topic:
+            return {"statusCode": 400, "body": json.dumps({"error": "Missing 'blog_topic'"})}
+
+        generated = blog_generate_using_bedrock(blog_topic=blog_topic)
+        if not generated:
+            return {"statusCode": 502, "body": json.dumps({"error": "Model did not return text"})}
+
+        now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        s3_key = f"blog-output/{now}.txt"
+        save_blog_details_in_s3(s3_key, S3_BUCKET, generated)
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "Blog Generated Successfully!", "s3_key": s3_key})
+        }
+
+    except Exception as e:
+        print(f"Handler error: {e}")
+        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
